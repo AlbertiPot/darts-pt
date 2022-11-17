@@ -1,6 +1,7 @@
+from email import utils
 import os
 import sys
-sys.path.insert(0, '../../')
+sys.path.insert(0, '/data/gbc/Workspace/pt/')
 import time
 import glob
 import random
@@ -31,8 +32,7 @@ from sota.cnn.projection import pt_project
 torch.set_printoptions(precision=4, sci_mode=False)
 
 parser = argparse.ArgumentParser("sota")
-parser.add_argument('--data', type=str, default='../../data',
-                    help='location of the data corpus')
+parser.add_argument('--data', type=str, default='../../data', help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='cifar10', help='choose dataset')
 parser.add_argument('--batch_size', type=int, default=64, help='batch size')
 parser.add_argument('--learning_rate', type=float, default=0.025, help='init learning rate')
@@ -84,9 +84,15 @@ parser.add_argument('--proj_crit_edge',   type=str, default='acc', choices=['los
 parser.add_argument('--proj_intv', type=int, default=10, help='interval between two projections')
 parser.add_argument('--proj_mode_edge', type=str, default='reg', choices=['reg'],
                     help='edge projection evaluation mode, reg: one edge at a time')
+## for patch
+parser.add_argument('--task', type=str, default='cls', help='specify pretext task')
+parser.add_argument('--mask_ratio', type=float, default=0.6, help='mask ratio of original image')
+parser.add_argument('--patch_size', type=int, default=8, help='patch size for masking image')
 
 args = parser.parse_args()
 
+assert args.task in ['cls', 'cls_mask'], "Task '{}' not supported".format(args.task)
+assert args.dataset in ['cifar10','cifar100'], "Dataset '{}' not supported".format(args.dataset)
 #### macros
 
 
@@ -95,7 +101,7 @@ if args.expid_tag != '':
     args.save += '-{}'.format(args.expid_tag)
 
 expid = args.save
-args.save = '../../experiments/sota/{}/search-{}-{}-{}'.format(
+args.save = '/data/gbc/Workspace/pt/results/{}/search-{}-{}-seed{}'.format(
     args.dataset, args.save, args.search_space, args.seed)
 
 if args.unrolled:
@@ -108,10 +114,10 @@ if args.cutout:
     args.save += '-cutout-' + str(args.cutout_length) + '-' + str(args.cutout_prob)
 
 if args.resume_epoch > 0: # do not delete dir when resume:
-    args.save = '../../experiments/sota/{}/{}'.format(args.dataset, args.resume_expid)
-    assert(os.path.exists(args.save), 'resume but {} does not exist!'.format(args.save))
+    args.save = '/data/gbc/Workspace/pt/results/{}/{}'.format(args.dataset, args.resume_expid)
+    assert(os.path.exists(args.save)), 'resume but {} does not exist!'.format(args.save)
 else:
-    scripts_to_save = glob.glob('*.py') + glob.glob('../../nasbench201/architect*.py') + glob.glob('../../optimizers/darts/architect.py')
+    scripts_to_save = glob.glob('/data/gbc/Workspace/pt/sota/cnn/*.py') + glob.glob('/data/gbc/Workspace/pt/nasbench201/architect*.py') + glob.glob('/data/gbc/Workspace/pt/optimizers/darts/architect.py')
     if os.path.exists(args.save):
         if 'debug' in args.expid_tag or input("WARNING: {} exists, override?[y/n]".format(args.save)) == 'y':
             print('proceed to override saving directory')
@@ -142,15 +148,15 @@ if args.dev != '':
     if args.log_tag != '': log_file += '_tag-{}'.format(args.log_tag)
 if args.log_tag == 'debug': ## prevent redundant debug log files
     log_file = 'log_debug'
-log_file += '.txt'
+log_file += '.log'
 log_path = os.path.join(args.save, log_file)
 logging.info('======> log filename: %s', log_file)
 
 if args.log_tag != 'debug' and os.path.exists(log_path):
-    if input("WARNING: {} exists, override?[y/n]".format(log_file)) == 'y':
-        print('proceed to override log file directory')
-    else:
-        exit(0)
+    # if input("WARNING: {} exists, override?[y/n]".format(log_file)) == 'y':
+    print('proceed to override log file directory')
+    # else:
+    #     exit(0)
 
 fh = logging.FileHandler(log_path, mode='w')
 fh.setFormatter(logging.Formatter(log_format))
@@ -162,15 +168,18 @@ args.dev_resume_checkpoint_dir = os.path.join(args.save, args.dev_resume_log)
 print(args.dev_resume_checkpoint_dir)
 if not os.path.exists(args.dev_resume_checkpoint_dir):
     os.mkdir(args.dev_resume_checkpoint_dir)
-args.dev_save_checkpoint_dir = os.path.join(args.save, log_file.replace('.txt', ''))
+args.dev_save_checkpoint_dir = os.path.join(args.save, log_file.replace('.log', ''))
 print(args.dev_save_checkpoint_dir)
 if not os.path.exists(args.dev_save_checkpoint_dir):
     os.mkdir(args.dev_save_checkpoint_dir)
 
 if args.dataset == 'cifar100':
     n_classes = 100
-else:
+    DATA_STATS = (-1.9, 2.03)
+elif args.dataset == 'cifar10':
     n_classes = 10
+    DATA_STATS = (-1.99, 2.13)
+print(DATA_STATS)
 
 def main():
     torch.set_num_threads(3)
@@ -197,29 +206,31 @@ def main():
         train_transform, valid_transform = ig_utils._data_transforms_cifar100(args)
         train_data = dset.CIFAR100(root=args.data, train=True, download=True, transform=train_transform)
         valid_data = dset.CIFAR100(root=args.data, train=False, download=True, transform=valid_transform)
-    elif args.dataset == 'svhn':
-        train_transform, valid_transform = ig_utils._data_transforms_svhn(args)
-        train_data = dset.SVHN(root=args.data, split='train', download=True, transform=train_transform)
-        valid_data = dset.SVHN(root=args.data, split='test', download=True, transform=valid_transform)
+    # elif args.dataset == 'svhn':
+    #     train_transform, valid_transform = ig_utils._data_transforms_svhn(args)
+    #     train_data = dset.SVHN(root=args.data, split='train', download=True, transform=train_transform)
+    #     valid_data = dset.SVHN(root=args.data, split='test', download=True, transform=valid_transform)
 
     num_train = len(train_data)
     indices = list(range(num_train))
     split = int(np.floor(args.train_portion * num_train))
 
     train_queue = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size,
+        train_data,
+        batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]),
         pin_memory=True)
 
     valid_queue = torch.utils.data.DataLoader(
-        train_data, batch_size=args.batch_size,
+        train_data,
+        batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
         pin_memory=True)
 
     test_queue  = torch.utils.data.DataLoader(
-        valid_data, batch_size=args.batch_size,
+        valid_data,
+        batch_size=args.batch_size,
         pin_memory=True)
-
 
     #### sdarts
     if args.perturb_alpha == 'none':
@@ -232,18 +243,23 @@ def main():
         print('ERROR PERTURB_ALPHA TYPE:', args.perturb_alpha); exit(1)
     
     #### model
-    criterion = nn.CrossEntropyLoss()
-    criterion = criterion.cuda()
+    if args.task == 'cls':
+        criterion = nn.CrossEntropyLoss()
+        criterion = criterion.cuda()
+    elif args.task == 'cls_mask':
+        c1 = nn.CrossEntropyLoss()
+        c2 = ig_utils.MaskMSE()
+        criterion = [c1.cuda(), c2.cuda()]
 
     ## darts
     if args.method in ['darts', 'blank']:
-        model = DartsNetwork(args.init_channels, n_classes, args.layers, criterion, spaces_dict[args.search_space], args)
+        model = DartsNetwork(args.init_channels, n_classes, args.layers, criterion, spaces_dict[args.search_space], args, DATA_STATS, task=args.task, patch_size=args.patch_size)
     ## sdarts
     elif args.method == 'sdarts':
         model = SDartsNetwork(args.init_channels, n_classes, args.layers, criterion, spaces_dict[args.search_space], args)
     ## projection
     elif args.method in ['darts-proj', 'blank-proj']:
-        model = DartsNetworkProj(args.init_channels, n_classes, args.layers, criterion, spaces_dict[args.search_space], args)
+        model = DartsNetworkProj(args.init_channels, n_classes, args.layers, criterion, spaces_dict[args.search_space], args, DATA_STATS, task=args.task, patch_size=args.patch_size)
     elif args.method in ['sdarts-proj']:
         model = SDartsNetworkProj(args.init_channels, n_classes, args.layers, criterion, spaces_dict[args.search_space], args)
     else:
@@ -285,7 +301,7 @@ def main():
     #### main search
     logging.info('starting training at epoch {}'.format(start_epoch))
     for epoch in range(start_epoch, args.epochs):
-        lr = scheduler.get_lr()[0]
+        lr = scheduler.get_last_lr()[0]
 
         ## data aug
         if args.cutout:
@@ -299,19 +315,19 @@ def main():
             epsilon_alpha = 0.03 + (args.epsilon_alpha - 0.03) * epoch / args.epochs
             logging.info('epoch %d epsilon_alpha %e', epoch, epsilon_alpha)
 
-        ## logging
-        num_params = ig_utils.count_parameters_in_Compact(model)
-        genotype = model.genotype()
-        logging.info('param size = %f', num_params)
-        logging.info('genotype = %s', genotype)
-        model.printing(logging)
-
         ## training
         train_acc, train_obj = train(train_queue, valid_queue, model, architect, model.optimizer, lr, epoch,
                                      perturb_alpha, epsilon_alpha)
         logging.info('train_acc %f | train_obj %f', train_acc, train_obj)
         writer.add_scalar('Acc/train', train_acc, epoch)
         writer.add_scalar('Obj/train', train_obj, epoch)
+
+        ## logging
+        num_params = ig_utils.count_parameters_in_Compact(model)
+        genotype = model.genotype()
+        logging.info('param size = %f', num_params)
+        logging.info('genotype = %s', genotype)
+        model.printing(logging)
 
         ## scheduler updates (before saving ckpts)
         scheduler.step()
@@ -347,24 +363,42 @@ def main():
     writer.close()
 
 
-def train(train_queue, valid_queue, model, architect, optimizer, lr, epoch,
+def train(train_queue, valid_queue, model, architect:Architect, optimizer, lr, epoch,
           perturb_alpha, epsilon_alpha):
     objs = ig_utils.AvgrageMeter()
     top1 = ig_utils.AvgrageMeter()
     top5 = ig_utils.AvgrageMeter()
 
-    for step in range(len(train_queue)):
+    for step, (input, target) in enumerate(train_queue):
         model.train()
 
-        ## data
-        input, target = next(iter(train_queue))
-        input = input.cuda(); target = target.cuda(non_blocking=True)
-        input_search, target_search = next(iter(valid_queue))
-        input_search = input_search.cuda(); target_search = target_search.cuda(non_blocking=True)
+        input = input.cuda()
+        target = target.cuda(non_blocking=True)
+
+        try:
+            input_search, target_search = next(valid_queue_iter)
+        except:
+            valid_queue_iter = iter(valid_queue)
+            input_search, target_search = next(valid_queue_iter)
+        
+        input_search = input_search.cuda()
+        target_search = target_search.cuda(non_blocking=True)
+
+        mask_search = None
+        mask = None
+        if args.task == 'cls_mask':
+            cls_target = target
+            input, rec_target, mask = ig_utils.mask_imgs(input, args.patch_size, args.mask_ratio)
+            target = [cls_target, rec_target]
+            cls_target_search = target_search
+            input_search, rec_target_search, mask_search = ig_utils.mask_imgs(input_search, args.patch_size, args.mask_ratio)
+            target_search = [cls_target_search, rec_target_search]
 
         ## train alpha
-        optimizer.zero_grad(); architect.optimizer.zero_grad()
-        architect.step(input, target, input_search, target_search, lr, optimizer)
+        optimizer.zero_grad()
+        architect.optimizer.zero_grad()
+        
+        architect.step(input, target, input_search, target_search, mask_search, False, lr, optimizer)
 
         ## sdarts
         if perturb_alpha:
@@ -374,8 +408,9 @@ def train(train_queue, valid_queue, model, architect, optimizer, lr, epoch,
             perturb_alpha(model, input, target, epsilon_alpha)
 
         ## train weights
-        optimizer.zero_grad(); architect.optimizer.zero_grad()
-        logits, loss = model.step(input, target, args)
+        optimizer.zero_grad()
+        architect.optimizer.zero_grad()
+        logits, loss = model.step(input, target, args, mask)
         
         ## sdarts
         if perturb_alpha:
@@ -384,10 +419,13 @@ def train(train_queue, valid_queue, model, architect, optimizer, lr, epoch,
 
         ## logging
         n = input.size(0)
-        prec1, prec5 = ig_utils.accuracy(logits, target, topk=(1, 5))
         objs.update(loss.data.item(), n)
-        top1.update(prec1.data.item(), n)
-        top5.update(prec5.data.item(), n)
+        if args.task == 'cls_mask':
+            logits, target = logits[0], target[0]
+        prec1, prec5 = ig_utils.accuracy(logits, target, topk=(1, 5))
+        top1.update(prec1.item(), n)
+        top5.update(prec5.item(), n)
+
         if step % args.report_freq == 0:
             logging.info('train %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
 
@@ -396,35 +434,58 @@ def train(train_queue, valid_queue, model, architect, optimizer, lr, epoch,
 
     return  top1.avg, objs.avg
 
-
-def infer(valid_queue, model, log=True, _eval=True, weights_dict=None):
+@torch.no_grad()
+def infer(valid_queue, model, log=True, _eval=True, weights_dict=None, pt=False):
     objs = ig_utils.AvgrageMeter()
     top1 = ig_utils.AvgrageMeter()
     top5 = ig_utils.AvgrageMeter()
-    model.eval() if _eval else model.train() # disable running stats for projection
+    model.eval() if _eval else model.train() # disable running stats for projection 因为去掉了算子，所以要重新计算bn
 
-    with torch.no_grad():
-        for step, (input, target) in enumerate(valid_queue):
-            input = input.cuda()
-            target = target.cuda(non_blocking=True)
-            
-            if weights_dict is None:
-                loss, logits = model._loss(input, target, return_logits=True)
+    for step, (input, target) in enumerate(valid_queue):
+        input = input.cuda()
+        target = target.cuda(non_blocking=True)
+        
+        mask = None
+        if args.task == 'cls_mask':
+            cls_taregt = target
+            # When pt, the input picture should be uncorrupted
+            if pt:
+                rec_target, mask = None, None
             else:
-                logits = model(input, weights_dict=weights_dict)
+                input, rec_target, mask = ig_utils.mask_imgs(input, args.patch_size, args.mask_ratio)
+            target = [cls_taregt, rec_target]
+
+        if weights_dict is None:
+            loss, logits = model._loss(input, target, mask, pt, return_logits=True)
+        else:
+            logits = model(input, weights_dict=weights_dict)
+            if args.task == 'cls':
                 loss = model._criterion(logits, target)
+            elif args.task == 'cls_mask':
+                assert type(logits) is list and type(target) is list
 
-            prec1, prec5 = ig_utils.accuracy(logits, target, topk=(1, 5))
-            n = input.size(0)
-            objs.update(loss.data.item(), n)
-            top1.update(prec1.data.item(), n)
-            top5.update(prec5.data.item(), n)
+                cls_l = model.cls_criterion(logits[0],target[0])
+                
+                if pt:
+                    loss = cls_l
+                else:
+                    rec_logits = ig_utils.patchify(logits[1], (args.patch_size,args.patch_size))
+                    rec_l = model.rec_criterion(rec_logits, target[1], mask)
+                    loss = cls_l + rec_l/(rec_l/cls_l).detach()
+     
+        n = input.size(0)
+        if args.task == 'cls_mask':
+            logits, target = logits[0], target[0]
+        prec1, prec5 = ig_utils.accuracy(logits, target, topk=(1, 5))
+        objs.update(loss.item(), n)
+        top1.update(prec1.item(), n)
+        top5.update(prec5.item(), n)
 
-            if step % args.report_freq == 0 and log:
-                logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
+        if step % args.report_freq == 0 and log:
+            logging.info('valid %03d %e %f %f', step, objs.avg, top1.avg, top5.avg)
 
-            if args.fast:
-                break
+        if args.fast:
+            break
 
     return top1.avg, objs.avg
 

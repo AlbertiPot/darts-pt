@@ -30,9 +30,9 @@ class Architect(object):
         for alpha, alpha_init in zip(self.model.arch_parameters(), self._init_arch_parameters):
             alpha.data.copy_(alpha_init.data)
 
-    def step(self, input_train, target_train, input_valid, target_valid, *args, **kwargs):
+    def step(self, input_train, target_train, input_valid, target_valid, patch_mask, pt=False, *args, **kwargs):
         if self.method == 'fo':
-            shared = self._step_fo(input_train, target_train, input_valid, target_valid)
+            shared = self._step_fo(input_valid, target_valid, patch_mask, pt)
         elif self.method == 'so':
             raise NotImplementedError
         elif self.method == 'blank': ## do not update alpha
@@ -41,8 +41,8 @@ class Architect(object):
         return shared
 
     #### first order
-    def _step_fo(self, input_train, target_train, input_valid, target_valid):
-        loss = self.model._loss(input_valid, target_valid)
+    def _step_fo(self, input_valid, target_valid, patch_mask, pt):
+        loss = self.model._loss(input_valid, target_valid, patch_mask, pt)
         loss.backward()
         self.optimizer.step()
         return None

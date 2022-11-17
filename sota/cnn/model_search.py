@@ -7,8 +7,44 @@ from sota.cnn.operations import *
 from sota.cnn.genotypes import Genotype
 import sys
 sys.path.insert(0, '../../')
-from nasbench201.utils import drop_path
+from nasbench201.utils import drop_path, patchify
 
+class Decoder(nn.Module):
+    def __init__(self, C, dataset_stats:tuple, scale_ratio=4):
+        super(Decoder, self).__init__()
+        self.dataset_min = dataset_stats[0]
+        self.dataset_max = dataset_stats[1]
+        
+        def upsample(in_feat, out_feat, normalize=True):
+            
+            layers = [nn.ConvTranspose2d(in_feat, out_feat, kernel_size=4, stride=2, padding=1)]
+            if normalize:
+                layers.append(nn.BatchNorm2d(out_feat))
+            layers.append(nn.ReLU())
+            
+            return layers
+
+        self.inter_conv = nn.Sequential(
+            nn.Conv2d(C, scale_ratio*C, kernel_size=3, padding=1),
+            nn.Conv2d(scale_ratio*C,C, kernel_size=1)
+        )
+        self.decoder = nn.Sequential(
+            nn.Conv2d(C, C, kernel_size=3, padding=1),
+            nn.BatchNorm2d(C),
+            nn.ReLU(),
+            *upsample(C, C//2),
+            nn.Conv2d(C//2, C//2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(C//2),
+            nn.ReLU(),
+            *upsample(C//2, C//4),
+            nn.Conv2d(C//4, 3, kernel_size=3, stride=1, padding=1),
+            nn.Hardtanh(self.dataset_min, self.dataset_max)
+        )
+
+    def forward(self, x):
+        x = self.inter_conv(x)
+        out = self.decoder(x)
+        return out
 
 class MixedOp(nn.Module):
     def __init__(self, C, stride, PRIMITIVES):
@@ -71,17 +107,23 @@ class Cell(nn.Module):
 
 
 class Network(nn.Module):
-    def __init__(self, C, num_classes, layers, criterion, primitives, args,
-                 steps=4, multiplier=4, stem_multiplier=3, drop_path_prob=0):
+    def __init__(self, C, num_classes, layers, criterion, primitives, args, dataset_stats:tuple,
+                 steps=4, multiplier=4, stem_multiplier=3, drop_path_prob=0, task = 'cls', patch_size=8):
         super(Network, self).__init__()
-        #### original code
+
         self._C = C
         self._num_classes = num_classes
         self._layers = layers
         self._criterion = criterion
+        if type(criterion) is list:
+            self.cls_criterion = criterion[0]
+            self.rec_criterion = criterion[1]
         self._steps = steps
         self._multiplier = multiplier
         self.drop_path_prob = drop_path_prob
+        self.dataset_stats = dataset_stats
+        self.task = task
+        self.patch_size = (patch_size,patch_size)
 
         nn.Module.PRIMITIVES = primitives; self.op_names = primitives
 
@@ -106,8 +148,13 @@ class Network(nn.Module):
             self.cells += [cell]
             C_prev_prev, C_prev = C_prev, multiplier*C_curr
 
-        self.global_pooling = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Linear(C_prev, num_classes)
+        if self.task == 'cls':
+            self.global_pooling = nn.AdaptiveAvgPool2d(1)
+            self.classifier = nn.Linear(C_prev, num_classes)
+        elif self.task == 'cls_mask':
+            self.global_pooling = nn.AdaptiveAvgPool2d(1)
+            self.classifier = nn.Linear(C_prev, num_classes)
+            self.rec_decoder = Decoder(C_prev, dataset_stats, scale_ratio=4)
 
         self._initialize_alphas()
 
@@ -128,10 +175,28 @@ class Network(nn.Module):
             momentum=momentum,
             weight_decay=weight_decay)
 
-    def _loss(self, input, target, return_logits=False):
+    def _loss(self, input, target, mask=None, pt=False, return_logits=False):
         logits = self(input)
-        loss = self._criterion(logits, target)
-        return (loss, logits) if return_logits else loss
+
+        if self.task == 'cls':
+            loss = self._criterion(logits, target)
+            
+            return (loss, logits) if return_logits else loss
+        elif self.task == 'cls_mask':
+            assert type(logits) is list and type(target) is list
+
+            cls_l = self.cls_criterion(logits[0],target[0])
+            
+            if pt:
+                loss = cls_l
+            else:
+                rec_logits = patchify(logits[1], patch_size=self.patch_size)
+                rec_l = self.rec_criterion(rec_logits, target[1], mask)
+                loss = cls_l + rec_l/(rec_l/cls_l).detach()
+            
+            return (loss, logits) if return_logits else loss
+
+        
 
     def _initialize_alphas(self):
         k = sum(1 for i in range(self._steps) for n in range(2+i))
@@ -163,16 +228,22 @@ class Network(nn.Module):
                 weights = weights_normal
 
             s0, s1 = s1, cell(s0, s1, weights, self.drop_path_prob)
-            
-        out = self.global_pooling(s1)
-        logits = self.classifier(out.view(out.size(0),-1))
+
+        if self.task == 'cls':
+            out = self.global_pooling(s1)
+            logits = self.classifier(out.view(out.size(0),-1))
+        elif self.task == 'cls_mask':
+            cls_out = self.global_pooling(s1)
+            cls_logits = self.classifier(cls_out.view(cls_out.size(0),-1))
+            rec_logits = self.rec_decoder(s1)
+            logits = [cls_logits, rec_logits]
 
         return logits
 
-    def step(self, input, target, args, shared=None):
+    def step(self, input, target, args, mask, pt=False, shared=None):
         assert shared is None, 'gradient sharing disabled'
         
-        Lt, logit_t = self._loss(input, target, return_logits=True)
+        Lt, logit_t = self._loss(input, target, mask, pt, return_logits=True)
         Lt.backward()
 
         nn.utils.clip_grad_norm_(self.get_weights(), args.grad_clip)
@@ -205,12 +276,12 @@ class Network(nn.Module):
     def get_weights(self):
         return self.parameters()
 
-    def new(self):
-        model_new = Network(self._C, self._num_classes, self._layers, self._criterion, self.PRIMITIVES, self._args,\
-                            drop_path_prob=self.drop_path_prob).cuda()
-        for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
-            x.data.copy_(y.data)
-        return model_new
+    # def new(self):
+    #     model_new = Network(self._C, self._num_classes, self._layers, self._criterion, self.PRIMITIVES, self._args,\
+    #                         drop_path_prob=self.drop_path_prob).cuda()
+    #     for x, y in zip(model_new.arch_parameters(), self.arch_parameters()):
+    #         x.data.copy_(y.data)
+    #     return model_new
 
     def clip(self):
         for p in self.arch_parameters():

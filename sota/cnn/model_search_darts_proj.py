@@ -8,28 +8,35 @@ sys.path.insert(0, '../../')
 from sota.cnn.model_search import Network
 
 class DartsNetworkProj(Network):
-    def __init__(self, C, num_classes, layers, criterion, primitives, args,
-                 steps=4, multiplier=4, stem_multiplier=3, drop_path_prob=0.0):
-        super(DartsNetworkProj, self).__init__(C, num_classes, layers, criterion, primitives, args,
-              steps=steps, multiplier=multiplier, stem_multiplier=stem_multiplier, drop_path_prob=drop_path_prob)
+    def __init__(self, C, num_classes, layers, criterion, primitives, args, dataset_stats:tuple,
+                 steps=4, multiplier=4, stem_multiplier=3, drop_path_prob=0.0, task='cls', patch_size=8):
+        
+        super(DartsNetworkProj, self).__init__(C, num_classes, layers, criterion, primitives, args, dataset_stats,
+              steps=steps, multiplier=multiplier, stem_multiplier=stem_multiplier, drop_path_prob=drop_path_prob, task=task, patch_size=patch_size)
         
         self._initialize_flags()
         self._initialize_proj_weights()
         self._initialize_topology_dicts()
 
     #### proj flags
+    # 用于2阶段拓扑搜索
     def _initialize_topology_dicts(self):
+        # 共有 0，1，2，3四个中间节点，0节点直接与输入连接（因此两个边必然保留），剩下1，2，3与之前的节点都有连接，所以在拓扑搜索阶段只保留两个节点
         self.nid2eids = {0:[2,3,4], 1:[5,6,7,8], 2:[9,10,11,12,13]}
+        # 选中的边存入这里
         self.nid2selected_eids = {
             'normal': {0:[],1:[],2:[]},
             'reduce': {0:[],1:[],2:[]},
         }
     
+    # 用于1阶段算子搜索
     def _initialize_flags(self):
+        # 存14条边
         self.candidate_flags = {
             'normal':torch.tensor(self.num_edges * [True], requires_grad=False, dtype=torch.bool).cuda(),
             'reduce':torch.tensor(self.num_edges * [True], requires_grad=False, dtype=torch.bool).cuda(),
         } # must be in this order
+        # 存后三个节点
         self.candidate_flags_edge = {
             'normal': torch.tensor(3 * [True], requires_grad=False, dtype=torch.bool).cuda(),
             'reduce': torch.tensor(3 * [True], requires_grad=False, dtype=torch.bool).cuda(),
@@ -69,14 +76,14 @@ class DartsNetworkProj(Network):
         ## proj op
         for eid in range(self.num_edges):
             if not self.candidate_flags[cell_type][eid]:
-                weights[eid].data.copy_(self.proj_weights[cell_type][eid])
+                weights[eid].data.copy_(self.proj_weights[cell_type][eid])  # proj_weights是alpha，这里是将未选中的边中的全部算子的alpha赋值0
 
         ## proj edge
-        for nid in self.nid2eids:
-            if not self.candidate_flags_edge[cell_type][nid]: ## projected node
-                for eid in self.nid2eids[nid]:
+        for nid in self.nid2eids:               # 遍历后3个节点
+            if not self.candidate_flags_edge[cell_type][nid]: ## projected node 是否选中该节点
+                for eid in self.nid2eids[nid]:          # 从该节点中选择所有和前面连接的边
                     if eid not in self.nid2selected_eids[cell_type][nid]:
-                        weights[eid].data.copy_(self.proj_weights[cell_type][eid])
+                        weights[eid].data.copy_(self.proj_weights[cell_type][eid])      #如果不是选中的边，则将该变的alpha赋值
 
         return weights
 
@@ -98,9 +105,15 @@ class DartsNetworkProj(Network):
                 weights = weights_normal
 
             s0, s1 = s1, cell(s0, s1, weights, self.drop_path_prob)
-            
-        out = self.global_pooling(s1)
-        logits = self.classifier(out.view(out.size(0),-1))
+        
+        if self.task == 'cls':
+            out = self.global_pooling(s1)
+            logits = self.classifier(out.view(out.size(0),-1))
+        elif self.task == 'cls_mask':
+            cls_out = self.global_pooling(s1)
+            cls_logits = self.classifier(cls_out.view(cls_out.size(0),-1))
+            rec_logits = self.rec_decoder(s1)
+            logits = [cls_logits, rec_logits]
 
         return logits
 

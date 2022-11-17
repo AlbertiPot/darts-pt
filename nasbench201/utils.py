@@ -6,12 +6,14 @@ import os.path
 import sys
 import shutil
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
 
 from PIL import Image
 from torch.autograd import Variable
 from torchvision.datasets import VisionDataset
 from torchvision.datasets import utils
+from torch import Tensor
 
 if sys.version_info[0] == 2:
     import cPickle as pickle
@@ -45,7 +47,7 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
+        correct_k = correct[:k].reshape(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
@@ -98,15 +100,20 @@ def _data_transforms_cifar100(args):
     CIFAR_MEAN = [0.5071, 0.4865, 0.4409]
     CIFAR_STD = [0.2673, 0.2564, 0.2762]
 
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-    ])
-    if args.cutout:
-        train_transform.transforms.append(Cutout(args.cutout_length,
-                                          args.cutout_prob))
+    if 'cls' in args.task:
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        ])
+        if args.cutout:
+            train_transform.transforms.append(Cutout(args.cutout_length, args.cutout_prob))
+    elif 'rec' in args.task:
+        train_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        ])
 
     valid_transform = transforms.Compose([
         transforms.ToTensor(),
@@ -119,16 +126,21 @@ def _data_transforms_cifar10(args):
     CIFAR_MEAN = [0.49139968, 0.48215827, 0.44653124]
     CIFAR_STD = [0.24703233, 0.24348505, 0.26158768]
 
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
-    ])
-    if args.cutout:
-        train_transform.transforms.append(Cutout(args.cutout_length,
-                                                 args.cutout_prob))
-
+    if 'cls' in args.task:
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        ])
+        if args.cutout:
+            train_transform.transforms.append(Cutout(args.cutout_length, args.cutout_prob))
+    elif 'rec' in args.task:
+        train_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        ])
+    
     valid_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
@@ -492,3 +504,122 @@ def gen_comb(eids):
             comb.append((eids[r], eids[c]))
 
     return comb
+
+def patchify(imgs, patch_size=(4, 4)):
+    """
+    imgs: (N, 3, H, W)
+    x: (N, L, patch_size**2 *3)
+    """
+    p = patch_size[0]
+    assert imgs.shape[2] == imgs.shape[3] and imgs.shape[2] % p == 0
+
+    h = w = imgs.shape[2] // p
+    x = imgs.reshape(shape=(imgs.shape[0], 3, h, p, w, p))
+    x = torch.einsum('nchpwq->nhwpqc', x)
+    x = x.reshape(shape=(imgs.shape[0], h * w, p**2 * 3))
+    return x
+
+
+def unpatchify(x, patch_size=(4, 4)):
+    """
+    x: (N, L, patch_size**2 *3)
+    imgs: (N, 3, H, W)
+    """
+    p = patch_size[0]
+    h = w = int(x.shape[1]**.5)
+    assert h * w == x.shape[1]
+
+    x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
+    x = torch.einsum('nhwpqc->nchpwq', x)
+    imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
+    return imgs
+
+
+def random_masking(x, mask_ratio=0.75):
+    """
+    Perform per-sample random masking by per-sample shuffling.
+    Per-sample shuffling is done by argsort random noise.
+    x: [N, L, D], sequence
+    """
+    N, L, D = x.shape  # batch, length, dim
+    len_keep = int(L * (1 - mask_ratio))
+
+    noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
+
+    # sort noise for each sample
+    ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+    ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+    # keep the first subset
+    ids_keep = ids_shuffle[:, :len_keep]
+    x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))  # 只保留未mask的patch
+
+    # masked part are filled with 1
+    mask_tokens = torch.ones(N, L - len_keep, D, device=x_masked.device)
+    x_masked = torch.cat([x_masked, mask_tokens], dim=1)
+
+    # unshuffle
+    x_masked = torch.gather(x_masked, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D))
+
+    # generate the binary mask: 0 is keep, 1 is remove
+    mask = torch.ones([N, L], device=x.device)
+    mask[:, :len_keep] = 0
+    # unshuffle to get the binary mask
+    mask = torch.gather(mask, dim=1, index=ids_restore)
+
+    return x_masked, mask
+
+def mask_imgs(org_imgs, patch_size, mask_ratio):
+    """
+    org_imgs: (N, 3, H, W)
+    
+    restore_imgs: (N, 3, H, W) as training samples
+    patched_img: (N, L, D) as target to compute per patch loss
+    mask: (N, L) for computing on removed patches
+    """
+    patched_img = patchify(org_imgs, (patch_size, patch_size))
+
+    patched_imgs_masked, mask = random_masking(patched_img.clone(), mask_ratio)
+
+    restore_imgs = unpatchify(patched_imgs_masked, (patch_size, patch_size))
+
+    return restore_imgs, patched_img, mask
+
+class MaskMSE(nn.Module):
+    def __init__(self):
+        super(MaskMSE, self).__init__()
+
+    def forward(self, pred: Tensor, target: Tensor, mask: Tensor):
+        """
+        pred: [N, L, p*p*3]
+        mask: [N, L], 0 is keep, 1 is remove
+        """
+
+        loss = (pred - target)**2
+        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+
+        loss = (loss * mask).sum() / mask.sum()
+
+        return loss
+
+class SamplesSaver(object):
+    def __init__(self, task, path_to_save):
+        assert task in ['cls_mask'], "Task '{}' not supported to save samples".format(task)
+        self.reset()
+        self.task = task
+        self.path_to_save = os.path.join(path_to_save, 'samples_visual.pt')
+
+    def reset(self):
+        self.task = None
+        self.path_to_save = None
+        self.sample_dict = {}
+
+    def update(self, epoch, origin, reconst, masked):
+        if self.task == 'rec':
+            self.sample_dict[epoch] = [origin, reconst]
+        elif 'mask' in self.task:
+            assert masked is not None
+            self.sample_dict[epoch] = [origin, reconst, masked]
+
+    def save(self):
+        torch.save(self.sample_dict, self.path_to_save)

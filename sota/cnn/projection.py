@@ -39,13 +39,13 @@ def project_op(model, proj_queue, args, infer, cell_type, selected_eid=None):
     for opid in range(num_ops):
         ## projection
         weights = model.get_projected_weights(cell_type)
-        proj_mask = torch.ones_like(weights[selected_eid])
+        proj_mask = torch.ones_like(weights[selected_eid])  # 生成每条边的7个op的mask
         proj_mask[opid] = 0
         weights[selected_eid] = weights[selected_eid] * proj_mask
 
         ## proj evaluation
         weights_dict = {cell_type:weights}
-        valid_stats = infer(proj_queue, model, log=False, _eval=False, weights_dict=weights_dict)
+        valid_stats = infer(proj_queue, model, log=False, _eval=False, weights_dict=weights_dict, pt=True)
         crit = valid_stats[crit_idx]
 
         if crit_extrema is None or compare(crit, crit_extrema):
@@ -89,7 +89,7 @@ def project_edge(model, proj_queue, args, infer, cell_type):
             weights_dict = {cell_type:weights}
 
             ## proj evaluation
-            valid_stats = infer(proj_queue, model, log=False, _eval=False, weights_dict=weights_dict)
+            valid_stats = infer(proj_queue, model, log=False, _eval=False, weights_dict=weights_dict, pt=True)
             crit = valid_stats[crit_idx]
 
             if crit_extrema is None or not compare(crit, crit_extrema): # find out bad edges
@@ -109,11 +109,11 @@ def pt_project(train_queue, valid_queue, model, architect, optimizer,
     model.train()
     model.printing(logging)
 
-    train_acc, train_obj = infer(train_queue, model, log=False)
+    train_acc, train_obj = infer(train_queue, model, log=False, pt=True)
     logging.info('train_acc  %f', train_acc)
     logging.info('train_loss %f', train_obj)
 
-    valid_acc, valid_obj = infer(valid_queue, model, log=False)
+    valid_acc, valid_obj = infer(valid_queue, model, log=False, pt=True)
     logging.info('valid_acc  %f', valid_acc)
     logging.info('valid_loss %f', valid_obj)
 
@@ -168,6 +168,7 @@ def pt_project(train_queue, valid_queue, model, architect, optimizer,
                 
                 selected_eid_normal, best_opid_normal = project_op(model, proj_queue, args, infer, cell_type='normal')
                 model.project_op(selected_eid_normal, best_opid_normal, cell_type='normal')
+                
                 selected_eid_reduce, best_opid_reduce = project_op(model, proj_queue, args, infer, cell_type='reduce')
                 model.project_op(selected_eid_reduce, best_opid_reduce, cell_type='reduce')
 
@@ -190,14 +191,32 @@ def pt_project(train_queue, valid_queue, model, architect, optimizer,
             ## fetch data
             input = input.cuda()
             target = target.cuda(non_blocking=True)
-            input_search, target_search = next(iter(valid_queue))
+            
+            try:
+                input_search, target_search = next(valid_queue_iter)
+            except:
+                valid_queue_iter = iter(valid_queue)
+                input_search, target_search = next(valid_queue_iter)
+            
             input_search = input_search.cuda()
             target_search = target_search.cuda(non_blocking=True)
 
+            mask_search = None
+            mask = None
+            if args.task == 'cls_mask':
+                cls_target = target
+                rec_target, mask = None, None
+                target = [cls_target, rec_target]
+
+                cls_target_search = target_search
+                rec_target_search, mask_search = None, None
+                target_search = [cls_target_search, rec_target_search]
+
+
             ## train alpha
-            optimizer.zero_grad(); architect.optimizer.zero_grad()
-            architect.step(input, target, input_search, target_search,
-                           return_logits=True)
+            optimizer.zero_grad()
+            architect.optimizer.zero_grad()
+            architect.step(input, target, input_search, target_search, mask_search, pt=True, return_logits=True)
 
             ## sdarts
             if perturb_alpha:
@@ -207,8 +226,10 @@ def pt_project(train_queue, valid_queue, model, architect, optimizer,
                 perturb_alpha(model, input, target, epsilon_alpha)
 
             ## train weight
-            optimizer.zero_grad(); architect.optimizer.zero_grad()
-            logits, loss = model.step(input, target, args)
+            optimizer.zero_grad()
+            architect.optimizer.zero_grad()
+            
+            logits, loss = model.step(input, target, args, mask, pt=True)
 
             ## sdarts
             if perturb_alpha:
@@ -216,6 +237,8 @@ def pt_project(train_queue, valid_queue, model, architect, optimizer,
                 model.restore_arch_parameters()
 
             ## logging
+            if args.task == 'cls_mask':
+                logits, target = logits[0], target[0]
             prec1, prec5 = ig_utils.accuracy(logits, target, topk=(1, 5))
             objs.update(loss.data, n)
             top1.update(prec1.data, n)
@@ -229,11 +252,11 @@ def pt_project(train_queue, valid_queue, model, architect, optimizer,
         ## one epoch end
         model.printing(logging)
 
-        train_acc, train_obj = infer(train_queue, model, log=False)
+        train_acc, train_obj = infer(train_queue, model, log=False, pt=True)
         logging.info('train_acc  %f', train_acc)
         logging.info('train_loss %f', train_obj)
 
-        valid_acc, valid_obj = infer(valid_queue, model, log=False)
+        valid_acc, valid_obj = infer(valid_queue, model, log=False, pt=True)
         logging.info('valid_acc  %f', valid_acc)
         logging.info('valid_loss %f', valid_obj)
 
